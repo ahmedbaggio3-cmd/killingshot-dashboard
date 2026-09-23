@@ -1791,6 +1791,9 @@ async function buildNav(){
     AVAILABLE_FEATURES.forEach(f => {
       if(perms.includes(f.id)) items.push(f);
     });
+    // المديونيات: كل إداري بيشوف لاعيبة فروعه بس (من غير ما تحتاج صلاحية)
+    if(session.role === 'admin' && !items.some(i => i.id === 'debtTracker'))
+      items.push({id:'debtTracker', label:'💰 متابعة المديونيات', icon:'coin'});
   }
 
   const nav = document.getElementById('navList');
@@ -1929,7 +1932,7 @@ async function renderPage(){
         else if (currentPage === 'trainerDashboard') html = await pageTrainerDashboard();
         else if (currentPage === 'bulkAttendance') html = await pageBulkAttendance();
         else if (currentPage === 'branchSchedule') html = await pageBranchSchedule();
-        else if (currentPage === 'debtTracker') html = await pageDebtTracker();
+        else if (currentPage === 'debtTracker' && session.role !== 'trainer') html = await pageDebtTracker();
         else if (currentPage === 'branchCompare') html = await pageBranchCompare();
         else if (currentPage === 'trainerReport') html = await pageTrainerReport();
         else html = emptyState('هذه الصفحة غير مصرحة لك أو قيد التطوير');
@@ -1969,7 +1972,7 @@ async function pageStaffHome() {
     <div style="font-size:40px; margin-bottom:16px;">🎯</div>
     <div style="font-size:20px; font-weight:800; margin-bottom:8px;">مرحباً بك في لوحة التحكم</div>
     <p class="muted">استخدم القائمة الجانبية للوصول إلى المهام المخصصة لك.</p>
-    ${perms.length === 0 ? '<p style="color:var(--warn); margin-top:10px; font-weight:bold;">لا توجد صلاحيات مخصصة لك بعد. يرجى مراجعة المدير الفني.</p>' : ''}
+    ${perms.length === 0 ? '<p style="color:var(--warn); margin-top:10px; font-weight:bold;">لا توجد صلاحيات مخصصة لك بعد. يرجى مراجعة الإدارة العليا.</p>' : ''}
   </div>`;
 }
 
@@ -3257,7 +3260,7 @@ async function submitForApproval(type, payload, description){
   };
   pending.push(req);
   await sSet('ks_pending_approvals', pending);
-  showToast('✅ تم إرسال التعديل للمدير الفني للموافقة');
+  showToast('✅ تم إرسال التعديل للإدارة العليا للموافقة');
 }
 
 async function getPendingApprovalsCount(){
@@ -3288,6 +3291,17 @@ async function approveRequest(reqId){
         await logTreasuryAudit('create', null, newEntry);
       }
       await sSet('ks_treasury_entries', all);
+    } else if(req.type === 'treasury_delete'){
+      const {entryId} = req.payload;
+      let all = (await sGet('ks_treasury_entries')) || [];
+      const entry = all.find(x=>x.id===entryId);
+      if(entry && !entry.deleted){
+        const before = {...entry};
+        entry.deleted = true; entry.deletedAt = new Date().toISOString();
+        entry.deletedBy = req.requestedBy + ' (بموافقة ' + session.name + ')';
+        await sSet('ks_treasury_entries', all);
+        await logTreasuryAudit('delete', before, null);
+      }
     } else if(req.type === 'sub_edit'){
       const {pid, month, isTeam, subData} = req.payload;
       const subPrefix = isTeam ? 'ks_team_subs_' : 'ks_subs_';
@@ -3554,6 +3568,12 @@ async function deleteTreasuryEntry(entryId, branch){
   if(!entry) return;
   const canProceed = await guardTreasuryLock(branch, entry.entryDate);
   if(!canProceed) return;
+  if(!isCoachOrSenior()){
+    if(!confirm('حذف العملية محتاج موافقة الإدارة العليا. أبعت الطلب؟')) return;
+    await submitForApproval('treasury_delete', {branch, entryId},
+      `حذف عملية: ${entry.category||'—'} · ${Number(entry.amount||0).toLocaleString()} ج.م · ${branch}`);
+    return;
+  }
   if(!confirm('متأكد إنك عايز تحذف العملية دي؟ هتفضل محفوظة في سجل التعديلات للمراجعة.')) return;
   const before = {...entry};
   entry.deleted = true;
@@ -7485,11 +7505,10 @@ async function submitTreasuryEntry(e, branch, entryId){
   };
   if(!data.entryDate || !data.receiptType || !data.category){ showToast('من فضلك املأ التاريخ ونوع الايصال وتصنيف الادخال على الأقل'); return false; }
 
-  // إداري → إرسال للموافقة بدل الحفظ المباشر
-  if(!isCoachOrSenior()){
-    const actionLabel = entryId ? 'تعديل عملية' : 'إضافة عملية';
+  // إداري: العملية الجديدة بتتحفظ على طول — التعديل على عملية موجودة بس هو اللي محتاج موافقة الإدارة العليا
+  if(!isCoachOrSenior() && entryId){
     await submitForApproval('treasury_entry', {branch, entryId, data},
-      `${actionLabel}: ${data.category||'—'} · ${Number(data.amount||0).toLocaleString()} ج.م · ${branch}`);
+      `تعديل عملية: ${data.category||'—'} · ${Number(data.amount||0).toLocaleString()} ج.م · ${branch}`);
     closeModal();
     return false;
   }
@@ -11373,12 +11392,25 @@ async function pageDebtTracker(){
     return {p, curRem, prevRem, totalDebt, lastContact: fu.lastContact||null, promiseDate: fu.promiseDate||null, note: fu.note||''};
   }).filter(Boolean).sort((a,b)=>b.totalDebt-a.totalDebt);
 
+  const dBranches = [...new Set(debtors.map(d=>d.p.branch).filter(Boolean))].sort();
+  const selB = dBranches.includes(window._debtBranch) ? window._debtBranch : 'all';
+  const q = (window._debtSearch||'').trim();
+  const allDebtors = debtors;
+  const shown = debtors.filter(d => (selB==='all' || d.p.branch===selB) && (!q || (d.p.name||'').includes(q) || String(d.p.code||'').includes(q)));
+  debtors.length = 0; shown.forEach(x => debtors.push(x));
   const totalDebt = debtors.reduce((s,d)=>s+d.totalDebt,0);
+  const scopeLbl = session.role === 'coach' ? 'كل الفروع' : ((session.branches && session.branches.length ? session.branches : [session.branch]).join('، '));
 
   return `
   <div class="topbar">
-    <div><div class="page-title">💰 متابعة المديونيات</div><div class="page-sub">إجمالي المديونيات: ${totalDebt.toLocaleString()} ج.م</div></div>
+    <div><div class="page-title">💰 متابعة المديونيات</div><div class="page-sub">${scopeLbl} · إجمالي المديونيات: ${totalDebt.toLocaleString()} ج.م</div></div>
+    <input type="text" placeholder="🔍 بحث بالاسم أو الكود" value="${q.replace(/"/g,'&quot;')}" onchange="window._debtSearch=this.value; renderPage()"
+      style="background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:10px; color:#fff; padding:8px 12px; min-width:200px;">
   </div>
+  ${dBranches.length > 1 ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;">
+    <button class="btn ${selB==='all'?'btn-primary':'btn-ghost'} btn-sm" onclick="window._debtBranch='all'; renderPage()">الكل (${allDebtors.length})</button>
+    ${dBranches.map(b=>`<button class="btn ${selB===b?'btn-primary':'btn-ghost'} btn-sm" onclick="window._debtBranch='${b.replace(/'/g,"\\'")}'; renderPage()">${b} (${allDebtors.filter(d=>d.p.branch===b).length})</button>`).join('')}
+  </div>` : ''}
   <div class="grid grid-3" style="margin-bottom:20px;">
     <div class="card stat-card"><div class="stat-label">إجمالي الديون</div><div class="stat-value" style="color:var(--red-light);">${totalDebt.toLocaleString()}</div><div class="stat-foot">ج.م</div></div>
     <div class="card stat-card"><div class="stat-label">عدد المدينين</div><div class="stat-value">${debtors.length}</div><div class="stat-foot">لاعب</div></div>
@@ -11421,14 +11453,26 @@ async function pageDebtTracker(){
                 onblur="saveDebtFollowup('${d.p.id}','note',this.value)">
             </td>
             <td style="padding:10px; text-align:center;">
-              <a href="https://wa.me/?text=${encodeURIComponent('السلام عليكم '+d.p.name+'،\nنود تذكيرك بسداد اشتراكك في Killing Shot Academy.\nالمبلغ المتبقي: '+d.totalDebt.toLocaleString()+' ج.م\nشكراً لك 🙏')}" target="_blank"
+              <a href="https://wa.me/${ksWaPhone(d.p.phone)}?text=${encodeURIComponent('السلام عليكم '+d.p.name+'،\nنود تذكيرك بسداد اشتراكك في Killing Shot Academy.\nالمبلغ المتبقي: '+d.totalDebt.toLocaleString()+' ج.م\nشكراً لك 🙏')}" target="_blank"
                 class="btn btn-ghost btn-sm" style="color:#25d366; border-color:rgba(37,211,102,0.3);" onclick="saveDebtFollowup('${d.p.id}','lastContact','${today}')">📲 واتساب</a>
+              ${d.lastContact?`<div style="font-size:10.5px; color:var(--paper-dim); margin-top:3px;">آخر تواصل: ${fmtDate(d.lastContact)}</div>`:''}
+              ${!ksWaPhone(d.p.phone)?`<div style="font-size:10.5px; color:var(--warn); margin-top:2px;">مفيش رقم</div>`:''}
             </td>
           </tr>`;
         }).join('')}
       </tbody>
     </table>
   </div>`;
+}
+
+// رقم مصري → صيغة واتساب (20XXXXXXXXXX)
+function ksWaPhone(ph){
+  let d = String(ph||'').replace(/[٠-٩]/g, c => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/\D/g,'');
+  if(!d) return '';
+  if(d.startsWith('00')) d = d.slice(2);
+  if(d.startsWith('0') && d.length === 11) d = '2' + d;
+  else if(d.length === 10 && d.startsWith('1')) d = '20' + d;
+  return d.length >= 11 ? d : '';
 }
 
 async function saveDebtFollowup(pid, field, value){
@@ -11442,121 +11486,237 @@ async function saveDebtFollowup(pid, field, value){
 // ══════════════════════════════════════════════════════════
 // 5. BRANCH SCHEDULE — جدول الفرع الأسبوعي
 // ══════════════════════════════════════════════════════════
+// عدد الملاعب الافتراضي لكل فرع (يتعدل من زرار ⚙️ الملاعب)
+const KS_DEFAULT_COURTS = [
+  [/نرجس/, 2], [/دايموند|دياموند/, 5], [/معادي|معادى/, 2], [/جولدن|جولدين/, 3],
+  [/لورو|لوروا/, 2], [/جاردن|جاردنز/, 2], [/بارك/, 2]
+];
+const KS_DAYS = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+async function ksCourtsFor(branch){
+  const cfg = (await sGet('ks_branch_courts')) || {};
+  if(cfg[branch]) return Number(cfg[branch]) || 1;
+  const d = KS_DEFAULT_COURTS.find(([re]) => re.test(branch||''));
+  return d ? d[1] : 1;
+}
+const ksLocalISO = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+function ksWeekStart(iso){
+  const d = iso ? new Date(iso+'T00:00:00') : new Date();
+  d.setDate(d.getDate() - d.getDay());
+  return ksLocalISO(d);
+}
+function ksAddDays(iso, n){ const d = new Date(iso+'T00:00:00'); d.setDate(d.getDate()+n); return ksLocalISO(d); }
+function ksFmt12(t){
+  if(!t) return '';
+  const [h,m] = t.split(':').map(Number);
+  const ap = h < 12 ? 'ص' : 'م';
+  const hh = h % 12 === 0 ? 12 : h % 12;
+  return `${hh}:${String(m||0).padStart(2,'0')} ${ap}`;
+}
+// الجدول الجديد: قائمة حصص لكل فرع — ولو فيه جدول قديم بيتنقل مرة واحدة
+async function ksLoadCourtSchedule(branch){
+  const key = 'ks_court_schedule_' + branch;
+  let list = await sGet(key);
+  if(Array.isArray(list)) return list;
+  list = [];
+  const old = (await sGet('ks_branch_schedule_' + branch)) || {};
+  Object.entries(old).forEach(([k, c]) => {
+    const [di, slot] = k.split('_');
+    const [h, m] = String(slot||'0:00').split(':');
+    const courtNum = parseInt(String(c.court||'').replace(/\D/g,'')) || 1;
+    list.push({ id: uid(), court: courtNum, repeat:'weekly', day: Number(di),
+      time: String(h).padStart(2,'0')+':'+String(m||'00').padStart(2,'0'), endTime:'',
+      group: c.group||'', trainer: c.trainer||'', count: c.count||'', note:'' });
+  });
+  if(list.length) await sSet(key, list);
+  return list;
+}
+function ksSessionOn(sess, dateISO){
+  if(sess.repeat === 'once') return sess.date === dateISO;
+  const d = new Date(dateISO+'T00:00:00').getDay();
+  if(sess.day !== d) return false;
+  if(sess.from && dateISO < sess.from) return false;
+  if(sess.until && dateISO > sess.until) return false;
+  return true;
+}
+function ksToMin(t){ if(!t) return 0; const [h,m]=t.split(':').map(Number); return h*60+(m||0); }
+
 async function pageBranchSchedule(){
-  const branches = [...new Set((await scopedPlayers('ks_players')).map(p=>p.branch))].sort();
-  const coaches = (await sGet('ks_coaches'))||[];
-  const selBranch = window._schedBranch || (branches[0]||'');
-  const days = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-  const scheduleKey = `ks_branch_schedule_${selBranch}`;
-  const schedule = (await sGet(scheduleKey)) || {};
-  const slots = ['8:00','9:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00'];
-  const branchPlayers = (await scopedPlayers('ks_players')).filter(p=>p.branch===selBranch&&(p.status||'active')==='active');
+  const playerBranches = (await scopedPlayers('ks_players')).map(p=>p.branch).filter(Boolean);
+  const cfg = (await sGet('ks_branch_courts')) || {};
+  let branches = [...new Set([...playerBranches, ...Object.keys(cfg)])].sort();
+  if(session.role !== 'coach' && typeof sessionCanSeeBranch === 'function') branches = branches.filter(b => sessionCanSeeBranch(b));
+  const selBranch = branches.includes(window._schedBranch) ? window._schedBranch : (branches[0]||'');
+  const courts = await ksCourtsFor(selBranch);
+  let court = Number(window._schedCourt||1); if(court > courts) court = 1;
+  const weekStart = ksWeekStart(window._schedWeek);
+  const dates = [...Array(7)].map((_,i)=>ksAddDays(weekStart,i));
+  const list = await ksLoadCourtSchedule(selBranch);
+  const today = todayISO();
+  const canEdit = session.role === 'coach' || session.role === 'admin';
+  const courtCount = n => list.filter(x => Number(x.court) === n).length;
+
+  const dayCol = (dISO, di) => {
+    const items = list.filter(x => Number(x.court) === court && ksSessionOn(x, dISO)).sort((a,b)=>ksToMin(a.time)-ksToMin(b.time));
+    return `<div style="flex:1; min-width:140px; background:${dISO===today?'rgba(166,55,59,0.07)':'rgba(255,255,255,0.02)'}; border:1px solid ${dISO===today?'rgba(200,80,85,0.35)':'rgba(255,255,255,0.06)'}; border-radius:14px; padding:10px; display:flex; flex-direction:column; gap:8px;">
+      <div style="text-align:center; padding-bottom:6px; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <div style="font-weight:800;">${KS_DAYS[di]}</div>
+        <div style="font-size:11.5px; color:var(--paper-dim);">${dISO.slice(8,10)}/${dISO.slice(5,7)}</div>
+      </div>
+      ${items.map(x=>`
+        <div onclick="${canEdit?`openCourtSessionModal('${selBranch}','${x.id}')`:''}" style="background:${x.repeat==='once'?'rgba(224,176,75,0.12)':'rgba(80,120,200,0.14)'}; border:1px solid ${x.repeat==='once'?'rgba(224,176,75,0.35)':'rgba(80,120,200,0.3)'}; border-radius:10px; padding:8px 10px; ${canEdit?'cursor:pointer;':''}">
+          <div style="font-weight:800; font-size:12.5px; direction:ltr; text-align:right;">${ksFmt12(x.time)}${x.endTime?' – '+ksFmt12(x.endTime):''}</div>
+          <div style="font-weight:700; font-size:12.5px; margin-top:2px;">${x.group||'حصة'}</div>
+          ${x.trainer?`<div style="font-size:11.5px; color:var(--blue-light);">${x.trainer}</div>`:''}
+          <div style="font-size:10.5px; color:var(--paper-dim);">${x.count?x.count+' لاعب · ':''}${x.repeat==='once'?'📌 مرة واحدة':'🔁 أسبوعي'}</div>
+        </div>`).join('') || `<div style="font-size:11.5px; color:rgba(255,255,255,0.2); text-align:center; padding:8px 0;">—</div>`}
+      ${canEdit?`<button onclick="openCourtSessionModal('${selBranch}','', '${dISO}')" style="margin-top:auto; background:none; border:1px dashed rgba(255,255,255,0.12); border-radius:10px; color:rgba(255,255,255,0.35); padding:6px; cursor:pointer; font-family:inherit;">＋</button>`:''}
+    </div>`;
+  };
 
   return `
   <div class="topbar">
-    <div><div class="page-title">🗓️ جدول الفرع</div><div class="page-sub">إدارة جدول الحصص الأسبوعي</div></div>
-    <div style="display:flex; gap:8px; align-items:center;">
-      <select onchange="window._schedBranch=this.value; renderPage()" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:10px; color:#fff; padding:8px 14px; font-size:13px;">
+    <div><div class="page-title">🗓️ جدول الفرع</div><div class="page-sub">${selBranch} · ${courts} ملعب</div></div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <select onchange="window._schedBranch=this.value; window._schedCourt=1; renderPage()" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:10px; color:#fff; padding:8px 14px; font-size:13px;">
         ${branches.map(b=>`<option value="${b}" ${b===selBranch?'selected':''}>${b}</option>`).join('')}
       </select>
-      <button class="btn btn-primary" onclick="openAddScheduleSlot('${selBranch}')">+ إضافة حصة</button>
+      ${session.role==='coach'?`<button class="btn btn-ghost" onclick="openCourtsConfigModal()">⚙️ الملاعب</button>`:''}
+      ${canEdit?`<button class="btn btn-primary" onclick="openCourtSessionModal('${selBranch}','')">＋ إضافة حصة</button>`:''}
     </div>
   </div>
-  <div style="overflow-x:auto;">
-    <table style="width:100%; border-collapse:collapse; font-size:12.5px; min-width:700px;">
-      <thead><tr>
-        <th style="padding:10px 8px; background:rgba(255,255,255,0.04); width:70px; text-align:right;">الوقت</th>
-        ${days.map(d=>`<th style="padding:10px 8px; background:rgba(255,255,255,0.04); text-align:center; font-weight:800;">${d}</th>`).join('')}
-      </tr></thead>
-      <tbody>
-        ${slots.map(slot=>`
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
-          <td style="padding:8px; color:var(--paper-dim); font-size:11.5px; font-weight:700; white-space:nowrap;">${slot}</td>
-          ${days.map((day,di)=>{
-            const cellKey = `${di}_${slot}`;
-            const cell = schedule[cellKey];
-            if(cell) return `<td style="padding:5px; vertical-align:top;">
-              <div style="background:rgba(80,120,200,0.15); border:1px solid rgba(80,120,200,0.3); border-radius:10px; padding:8px 10px; cursor:pointer; position:relative;" onclick="openEditScheduleSlot('${selBranch}','${cellKey}')">
-                <div style="font-weight:800; font-size:12px; margin-bottom:2px;">${cell.group||'مجموعة'}</div>
-                <div style="font-size:11px; color:var(--blue-light);">${cell.trainer||'—'}</div>
-                <div style="font-size:10.5px; color:var(--paper-dim);">${cell.court||''} · ${cell.count||'?'} لاعب</div>
-                <button onclick="event.stopPropagation(); deleteScheduleSlot('${selBranch}','${cellKey}')" style="position:absolute; top:4px; left:4px; background:none; border:none; color:var(--paper-dim); cursor:pointer; font-size:14px; line-height:1; padding:0;">×</button>
-              </div>
-            </td>`;
-            return `<td style="padding:5px; vertical-align:top;"><div style="height:44px; border:1px dashed rgba(255,255,255,0.07); border-radius:10px; cursor:pointer; display:flex; align-items:center; justify-content:center; color:rgba(255,255,255,0.15); font-size:18px;" onclick="openAddScheduleSlot('${selBranch}','${di}','${slot}')">+</div></td>`;
-          }).join('')}
-        </tr>`).join('')}
-      </tbody>
-    </table>
+
+  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px;">
+    ${[...Array(courts)].map((_,i)=>`<button onclick="window._schedCourt=${i+1}; renderPage()" class="btn ${court===i+1?'btn-primary':'btn-ghost'}" style="min-width:100px;">🎾 ملعب ${i+1} <span style="opacity:.6; font-size:11px;">(${courtCount(i+1)})</span></button>`).join('')}
   </div>
-  <div class="card" style="margin-top:18px;">
-    <div class="section-title">لاعبو ${selBranch} (${branchPlayers.length} لاعب)</div>
-    <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">
-      ${branchPlayers.map(p=>`<span class="pill blue" style="cursor:pointer;" onclick="openPlayer('${p.id}')">${p.name}</span>`).join('')}
+
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:12px; flex-wrap:wrap;">
+    <div style="display:flex; gap:6px; align-items:center;">
+      <button class="btn btn-ghost btn-sm" onclick="window._schedWeek='${ksAddDays(weekStart,-7)}'; renderPage()">→ الأسبوع اللي فات</button>
+      <button class="btn btn-ghost btn-sm" onclick="window._schedWeek=''; renderPage()">النهارده</button>
+      <button class="btn btn-ghost btn-sm" onclick="window._schedWeek='${ksAddDays(weekStart,7)}'; renderPage()">الأسبوع الجاي ←</button>
     </div>
-  </div>`;
+    <div style="display:flex; gap:8px; align-items:center;">
+      <input type="date" value="${weekStart}" onchange="window._schedWeek=this.value; renderPage()" style="background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:10px; color:#fff; padding:6px 10px;">
+      <span class="muted" style="font-size:12.5px;">${fmtDate?fmtDate(dates[0]):dates[0]} – ${fmtDate?fmtDate(dates[6]):dates[6]}</span>
+    </div>
+  </div>
+
+  <div style="display:flex; gap:8px; overflow-x:auto; padding-bottom:6px;">
+    ${dates.map((d,i)=>dayCol(d,i)).join('')}
+  </div>
+  <div class="muted" style="font-size:12px; margin-top:10px;">🔁 أزرق = حصة أسبوعية ثابتة · 📌 دهبي = حصة في تاريخ محدد</div>`;
 }
 
-async function openAddScheduleSlot(branch, dayIdx, slot){
+async function openCourtSessionModal(branch, id, dateISO){
   const coaches = (await sGet('ks_coaches'))||[];
-  const scheduleKey = `ks_branch_schedule_${branch}`;
-  const schedule = (await sGet(scheduleKey))||{};
-  const days = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-  const slots = ['8:00','9:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00'];
-  const editKey = (dayIdx!==undefined && slot) ? `${dayIdx}_${slot}` : null;
-  const existing = editKey ? (schedule[editKey]||{}) : {};
-
+  const list = await ksLoadCourtSchedule(branch);
+  const courts = await ksCourtsFor(branch);
+  const x = id ? (list.find(s=>s.id===id)||{}) : {};
+  const date = x.date || dateISO || todayISO();
+  const repeat = x.repeat || 'weekly';
+  const day = x.day !== undefined ? x.day : new Date(date+'T00:00:00').getDay();
+  const court = x.court || Number(window._schedCourt||1);
   document.getElementById('modalRoot').innerHTML = `
   <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
-    <div class="card modal" style="max-width:420px;">
-      <h3>${editKey ? 'تعديل' : 'إضافة'} حصة تدريبية</h3>
-      <div class="field"><label>اليوم</label><select id="ssDayIdx">${days.map((d,i)=>`<option value="${i}" ${i==dayIdx?'selected':''}>${d}</option>`).join('')}</select></div>
-      <div class="field"><label>الوقت</label><select id="ssSlot">${slots.map(s=>`<option value="${s}" ${s===slot?'selected':''}>${s}</option>`).join('')}</select></div>
-      <div class="field"><label>اسم المجموعة</label><input id="ssGroup" value="${existing.group||''}" placeholder="مثال: مجموعة A"></div>
-      <div class="field"><label>المدرب</label><select id="ssTrainer">
-        <option value="">اختر مدرب</option>
-        ${coaches.map(c=>`<option value="${c.name}" ${c.name===existing.trainer?'selected':''}>${c.name}</option>`).join('')}
-      </select></div>
-      <div class="field"><label>الملعب/الصالة</label><input id="ssCourt" value="${existing.court||''}" placeholder="مثال: ملعب 1"></div>
-      <div class="field"><label>عدد اللاعبين المتوقع</label><input id="ssCount" type="number" value="${existing.count||''}" placeholder="مثال: 8"></div>
+    <div class="card modal" style="max-width:460px;">
+      <h3>${id?'تعديل':'إضافة'} حصة — ${branch}</h3>
+      <div class="field"><label>الملعب</label><select id="csCourt">${[...Array(courts)].map((_,i)=>`<option value="${i+1}" ${Number(court)===i+1?'selected':''}>ملعب ${i+1}</option>`).join('')}</select></div>
+      <div class="field"><label>التكرار</label>
+        <select id="csRepeat" onchange="document.getElementById('csDayWrap').style.display=this.value==='weekly'?'':'none'; document.getElementById('csDateWrap').style.display=this.value==='once'?'':'none';">
+          <option value="weekly" ${repeat==='weekly'?'selected':''}>🔁 كل أسبوع</option>
+          <option value="once" ${repeat==='once'?'selected':''}>📌 مرة واحدة في تاريخ محدد</option>
+        </select></div>
+      <div class="field" id="csDayWrap" style="display:${repeat==='weekly'?'':'none'};"><label>اليوم</label>
+        <select id="csDay">${KS_DAYS.map((d,i)=>`<option value="${i}" ${i===Number(day)?'selected':''}>${d}</option>`).join('')}</select>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px;">
+          <div><label style="font-size:11.5px;">يبدأ من (اختياري)</label><input type="date" id="csFrom" value="${x.from||''}"></div>
+          <div><label style="font-size:11.5px;">لحد (اختياري)</label><input type="date" id="csUntil" value="${x.until||''}"></div>
+        </div>
+      </div>
+      <div class="field" id="csDateWrap" style="display:${repeat==='once'?'':'none'};"><label>التاريخ</label><input type="date" id="csDate" value="${date}"></div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+        <div class="field"><label>من الساعة</label><input type="time" id="csTime" value="${x.time||'16:00'}" required></div>
+        <div class="field"><label>لحد الساعة</label><input type="time" id="csEnd" value="${x.endTime||''}"></div>
+      </div>
+      <div class="field"><label>اسم المجموعة / الحصة</label><input id="csGroup" value="${x.group||''}" placeholder="مثال: Elite A"></div>
+      <div class="field"><label>المدرب</label><select id="csTrainer"><option value="">اختر مدرب</option>${coaches.map(c=>`<option value="${c.name}" ${c.name===x.trainer?'selected':''}>${c.name}</option>`).join('')}</select></div>
+      <div class="field"><label>عدد اللاعبين المتوقع</label><input id="csCount" type="number" value="${x.count||''}"></div>
+      <div class="field"><label>ملاحظات</label><input id="csNote" value="${x.note||''}"></div>
+      <div id="csErr" style="color:var(--warn); font-size:12.5px; min-height:16px;"></div>
       <div class="modal-actions">
-        <button class="btn btn-primary" onclick="saveScheduleSlot('${branch}')">💾 حفظ</button>
+        ${id?`<button class="btn btn-ghost" style="color:var(--red-light);" onclick="deleteCourtSession('${branch}','${id}')">🗑️ حذف</button>`:''}
         <button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>
+        <button class="btn btn-primary" onclick="saveCourtSession('${branch}','${id||''}')">💾 حفظ</button>
       </div>
     </div>
   </div>`;
 }
-async function openEditScheduleSlot(branch, cellKey){
-  const [dayIdx, slot] = cellKey.split('_');
-  await openAddScheduleSlot(branch, Number(dayIdx), slot);
-  // store cellKey so save knows what to overwrite
-  window._editingScheduleKey = cellKey;
-}
-async function saveScheduleSlot(branch){
-  const dayIdx = document.getElementById('ssDayIdx').value;
-  const slot = document.getElementById('ssSlot').value;
-  const cellKey = `${dayIdx}_${slot}`;
-  const scheduleKey = `ks_branch_schedule_${branch}`;
-  const schedule = (await sGet(scheduleKey))||{};
-  schedule[cellKey] = {
-    group: document.getElementById('ssGroup').value.trim(),
-    trainer: document.getElementById('ssTrainer').value,
-    court: document.getElementById('ssCourt').value.trim(),
-    count: document.getElementById('ssCount').value
+async function saveCourtSession(branch, id, force){
+  const g = k => document.getElementById(k).value;
+  const repeat = g('csRepeat');
+  const rec = {
+    court: Number(g('csCourt')), repeat, time: g('csTime'), endTime: g('csEnd'),
+    group: g('csGroup').trim(), trainer: g('csTrainer'), count: g('csCount'), note: g('csNote').trim()
   };
-  await sSet(scheduleKey, schedule);
-  closeModal();
-  showToast('✅ تم حفظ الحصة');
-  renderPage();
+  if(!rec.time){ document.getElementById('csErr').textContent = 'حدد وقت البداية'; return; }
+  if(rec.endTime && ksToMin(rec.endTime) <= ksToMin(rec.time)){ document.getElementById('csErr').textContent = 'وقت النهاية لازم يكون بعد البداية'; return; }
+  if(repeat === 'weekly'){ rec.day = Number(g('csDay')); rec.from = g('csFrom')||''; rec.until = g('csUntil')||''; }
+  else { rec.date = g('csDate'); if(!rec.date){ document.getElementById('csErr').textContent = 'حدد التاريخ'; return; } }
+  const key = 'ks_court_schedule_' + branch;
+  const list = await ksLoadCourtSchedule(branch);
+  // تحذير لو فيه حصة تانية على نفس الملعب في نفس الوقت
+  if(!force){
+    const end = rec.endTime ? ksToMin(rec.endTime) : ksToMin(rec.time) + 60;
+    const clash = list.find(o => o.id !== id && Number(o.court) === rec.court && (() => {
+      const sameDay = (rec.repeat==='once' && o.repeat==='once') ? o.date === rec.date
+        : (rec.repeat==='weekly' && o.repeat==='weekly') ? o.day === rec.day
+        : rec.repeat==='once' ? ksSessionOn(o, rec.date) : ksSessionOn(rec, o.date);
+      if(!sameDay) return false;
+      const oEnd = o.endTime ? ksToMin(o.endTime) : ksToMin(o.time) + 60;
+      return ksToMin(rec.time) < oEnd && ksToMin(o.time) < end;
+    })());
+    if(clash && !confirm(`⚠️ ملعب ${rec.court} عليه حصة تانية في نفس الوقت: ${clash.group||'حصة'} (${ksFmt12(clash.time)}).\nتحفظ برضو؟`)) return;
+  }
+  if(id){ const i = list.findIndex(o=>o.id===id); if(i>-1) list[i] = {...list[i], ...rec, id}; }
+  else list.push({id: uid(), ...rec});
+  if(repeat === 'weekly'){ const o = list.find(z=>z.id===id); if(o){ delete o.date; } }
+  else { const o = list.find(z=>z.id===id); if(o){ delete o.day; delete o.from; delete o.until; } }
+  await sSet(key, list);
+  window._schedCourt = rec.court;
+  closeModal(); showToast('✅ تم حفظ الحصة'); renderPage();
 }
-async function deleteScheduleSlot(branch, cellKey){
+async function deleteCourtSession(branch, id){
   if(!confirm('حذف الحصة دي؟')) return;
-  const scheduleKey = `ks_branch_schedule_${branch}`;
-  const schedule = (await sGet(scheduleKey))||{};
-  delete schedule[cellKey];
-  await sSet(scheduleKey, schedule);
-  showToast('تم حذف الحصة');
-  renderPage();
+  const key = 'ks_court_schedule_' + branch;
+  const list = (await ksLoadCourtSchedule(branch)).filter(o=>o.id!==id);
+  await sSet(key, list);
+  closeModal(); showToast('تم حذف الحصة'); renderPage();
+}
+async function openCourtsConfigModal(){
+  const playerBranches = (await scopedPlayers('ks_players')).map(p=>p.branch).filter(Boolean);
+  const cfg = (await sGet('ks_branch_courts')) || {};
+  const branches = [...new Set([...playerBranches, ...Object.keys(cfg)])].sort();
+  const vals = await Promise.all(branches.map(b=>ksCourtsFor(b)));
+  document.getElementById('modalRoot').innerHTML = `
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="card modal" style="max-width:420px;">
+      <h3>⚙️ عدد الملاعب في كل فرع</h3>
+      ${branches.map((b,i)=>`<div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+        <span style="font-weight:700;">${b}</span>
+        <input type="number" min="1" max="20" class="ccIn" data-b="${b.replace(/"/g,'&quot;')}" value="${vals[i]}" style="width:80px; text-align:center;">
+      </div>`).join('')}
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeModal()">إلغاء</button>
+        <button class="btn btn-primary" onclick="saveCourtsConfig()">💾 حفظ</button>
+      </div>
+    </div>
+  </div>`;
+}
+async function saveCourtsConfig(){
+  const cfg = {};
+  document.querySelectorAll('.ccIn').forEach(i=>{ cfg[i.dataset.b] = Math.max(1, Math.min(20, Number(i.value)||1)); });
+  await sSet('ks_branch_courts', cfg);
+  closeModal(); showToast('✅ اتحفظ عدد الملاعب'); renderPage();
 }
 
 // ══════════════════════════════════════════════════════════
