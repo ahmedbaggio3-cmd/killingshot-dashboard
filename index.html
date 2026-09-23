@@ -1385,8 +1385,7 @@ async function migratePlayerBranchNames(){
 async function ensureSeed(){
   await migratePlayerBranchNames();
   let players = await sGet('ks_players') || [];
-
-  const tdPin = await sha256('3007');
+  const _seedBefore = JSON.stringify(players);
 
   let tdExists = players.find(p => p.role === 'coach' && (p.username === 'أحمد مجدي' || p.username === 'ahmed' || p.id === 'td_ahmed'));
 
@@ -1395,8 +1394,7 @@ async function ensureSeed(){
       id: 'td_ahmed',
       role: 'coach',
       username: 'أحمد مجدي',
-      pinHash: tdPin || '',
-      pinText: '3007',
+      pinHash: '',
       name: 'أحمد مجدي أمين الدكروري',
       branch: 'الكل',
       level: '-',
@@ -1404,13 +1402,12 @@ async function ensureSeed(){
     });
   } else {
     tdExists.username = 'أحمد مجدي';
-    if(!tdExists.pinText && !tdExists.pinHash){ tdExists.pinHash = tdPin || ''; tdExists.pinText = '3007'; }
     tdExists.role     = 'coach';
     delete tdExists.staffLevel;   // حساب المطور مش "إدارة عليا"
     if(tdExists.status && tdExists.status !== 'active') tdExists.status = 'active';
     tdExists.name     = 'أحمد مجدي أمين الدكروري';
   }
-  await sSet('ks_players', players);
+  if(JSON.stringify(players) !== _seedBefore) await sSet('ks_players', players);
 
   let teamPlayers = await sGet('ks_team_players');
   if(!teamPlayers) {
@@ -1523,6 +1520,24 @@ async function ksProvisionStaff(user, pin, oldUsername){
 }
 function ksIsActivatableStaff(u){ return u.role === 'admin' || u.role === 'coach'; }
 
+// يشيل الأرقام السرية الصريحة من الحسابات اللي اتفعّلت على Firebase (بيشتغل لوحده لما المطور/الإدارة تدخل)
+async function ksStripActivatedPins(){
+  if(!ksAuthActive()) return 0;
+  const players = (await sGet('ks_players')) || [];
+  let n = 0;
+  for(const u of players){
+    if(!ksIsActivatableStaff(u) || u.pinText === undefined) continue;
+    try {
+      if(await window.ksAuth.getLogin(await ksUserHash(u.username))){
+        if(!u.pinHash && u.pinText) u.pinHash = await sha256(String(u.pinText));
+        delete u.pinText; n++;
+      }
+    } catch(e){}
+  }
+  if(n) await sSet('ks_players', players);
+  return n;
+}
+
 function openChangeMyPinModal(){
   document.getElementById('modalRoot').innerHTML = `
   <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
@@ -1566,7 +1581,7 @@ async function submitChangeMyPin(e){
     return false;
   }
   me.pinHash = await sha256(newPin);
-  me.pinText = newPin;
+  if(ksAuthActive()) delete me.pinText; else me.pinText = newPin;
   await sSet('ks_players', players);
   closeModal();
   showToast('✅ اتغير رقمك السري — ادخل بيه المرة الجاية');
@@ -1589,6 +1604,7 @@ async function ksActivateAllAccounts(){
       done++;
     }catch(err){ failed.push((u.name||u.username)+' ('+(err.code||err.message)+')'); }
   }
+  try { await ksStripActivatedPins(); } catch(e){}
   alert('✅ اتفعّل: '+done+'\n☑️ كانوا مفعّلين قبل كده: '+already + (failed.length ? '\n\n❌ ماتفعلوش:\n- '+failed.join('\n- ') : ''));
   renderPage();
 }
@@ -1609,7 +1625,12 @@ async function handleLogin(e){
     try { rec = await window.ksAuth.getLogin(h); } catch(err){ rec = undefined; cloudErr = err.code || err.message || 'unknown'; console.warn(err); }
     window._ksLoginCloudErr = cloudErr;
     if(rec === null){
-      const isDevBootstrap = loginRole === 'developer' && normalize(rawUsername) === normalize('أحمد مجدي') && pin === '3007';
+      let isDevBootstrap = false;
+      if(loginRole === 'developer' && normalize(rawUsername) === normalize('أحمد مجدي')){
+        const lp = ((await pGet('ks_players')) || []).find(p => p.role === 'coach' && normalize(p.username) === normalize(rawUsername));
+        const ph = await sha256(pin);
+        isDevBootstrap = !!lp && ((lp.pinHash && lp.pinHash === ph) || (lp.pinText && String(lp.pinText) === pin));
+      }
       let canBootstrap = false;
       if(isDevBootstrap){ try { canBootstrap = !(await window.ksAuth.bootstrapExists()); } catch(err){} }
       if(!canBootstrap){
@@ -1663,18 +1684,19 @@ async function handleLogin(e){
     diag += ' · tab:' + loginRole;
     console.warn('login diag', diag);
     errEl.innerHTML = '';
-    errEl.textContent = (window._ksLoginCloudErr
-      ? 'تعذر الاتصال بالسيرفر ('+window._ksLoginCloudErr+') — اتأكد من قواعد Firestore'
-      : 'اسم المستخدم أو الرقم السري غير صحيح (تأكد من اختيار التبويب الصحيح للأعلى)') + '  [' + diag + ']';
+    errEl.textContent = window._ksLoginCloudErr
+      ? 'تعذر الاتصال بالسيرفر — حاول تاني بعد شوية'
+      : 'اسم المستخدم أو الرقم السري غير صحيح (تأكد من اختيار التبويب الصحيح للأعلى)';
     return false;
   }
 
-  if(usedCloudAuth && String(match.pinText||'') !== String(pin)){
-    // الرقم السري المحفوظ كان قديم — نحدّثه بالرقم اللي Firebase أكّده
-    match.pinText = pin;
-    match.pinHash = hash || match.pinHash || '';
+  if(usedCloudAuth && (match.pinText !== undefined || (hash && match.pinHash !== hash))){
+    // Firebase هو المرجع: نخزن نسخة مشفرة بس ونشيل الرقم الصريح
+    delete match.pinText;
+    if(hash) match.pinHash = hash;
     try { await sSet('ks_players', players); } catch(err){}
   }
+  if(usedCloudAuth && match.role === 'coach') setTimeout(() => ksStripActivatedPins().catch(()=>{}), 12000);
   session = {id: match.id, role: match.role, name: match.name, username: match.username, branch: match.branch, branches: match.branches, staffLevel: match.staffLevel};
   await pSet('ks_session', {id: match.id});
   await enterApp();
@@ -3876,6 +3898,7 @@ async function pageAccounting(){
     {id:'chart',    label:'🌳 شجرة الحسابات'},
     {id:'period',   label:'📑 تقرير بالفترة'},
     {id:'fiscal',   label:'📅 السنة المالية'},
+    {id:'mapping',  label:'🔗 ربط الخزينة'},
     {id:'journal',  label:'📔 دفتر اليومية'},
     {id:'trial',    label:'⚖️ ميزان المراجعة'},
     {id:'income',   label:'📊 قائمة الدخل'},
@@ -5068,6 +5091,9 @@ async function pageAccounting(){
   } else if(tab==='fiscal'){
     tabContent = await renderFiscalTab();
 
+  } else if(tab==='mapping'){
+    tabContent = await renderMappingTab();
+
   } else if(tab==='alerts'){
     const alertSettings  = (await sGet('ks_accounting_alerts'))||{minCash:5000, maxDebtMonths:2, collectionTarget:80, budgetWarning:90};
     const allTreasury3   = ((await sGet('ks_treasury_entries'))||[]).filter(e=>!e.deleted);
@@ -5459,6 +5485,50 @@ async function mergeBranchStructure(){
 // ═══════════════════════════════════════════════════════════
 //  📚 دفتر الأستاذ الموحد: حركات الخزينة + القيود اليدوية
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  🔗 ربط حركات الخزينة بحسابات الفروع
+//  ks_acct_mapping = { branchMap:{فرع الخزينة: فرع محاسبي}, catMap:{تصنيف:{kind:'rev'|'exp'|'acc'|'', activity, item, accId}} }
+// ═══════════════════════════════════════════════════════════
+const KS_DEFAULT_CAT_MAP = {
+  'اشتراك':            {kind:'rev', activity:'Elite'},
+  'جماعي':             {kind:'rev', activity:'Group'},
+  'جماعي خارجي':       {kind:'rev', activity:'Group'},
+  'استروكر':           {kind:'rev', activity:'Strokes'},
+  'راتب':              {kind:'exp', item:'رواتب'},
+  'راتب مشاهر':        {kind:'exp', item:'رواتب'},
+  'مرافق':             {kind:'exp', item:'مرافق'},
+  'ايجار مثبت':        {kind:'exp', item:'إيجار'},
+  'ايجار غير مثبت':    {kind:'exp', item:'إيجار'},
+  'تأمين ملاعب مثبتة': {kind:'exp', item:'إيجار'},
+  'مصروفات':           {kind:'exp', item:'مصروفات أخرى'}
+};
+function ksGuessAccBranch(b){
+  const s = String(b||'');
+  if(/نرجس/.test(s)) return 'توليب النرجس';
+  if(/جاردن|جاردين|جاردنز/.test(s)) return 'توليب جاردنز';
+  if(/دايموند|دياموند|داىموند|diamond/i.test(s)) return 'دايموند';
+  if(/معادي|المعادى/.test(s)) return 'المعادي';
+  return '';
+}
+async function getAcctMapping(){
+  const saved = (await sGet('ks_acct_mapping')) || null;
+  if(saved) return { branchMap: saved.branchMap || {}, catMap: saved.catMap || {} };
+  const branches = await getTreasuryBranches();
+  const branchMap = {};
+  branches.forEach(b => { const g = ksGuessAccBranch(b); if(g) branchMap[b] = g; });
+  return { branchMap, catMap: JSON.parse(JSON.stringify(KS_DEFAULT_CAT_MAP)), _default: true };
+}
+// بيرجع الحساب اللي الحركة تترحل عليه (أو null لو مفيش ربط)
+function ksResolveMappedAccount(mapping, byName, byId, category, branch){
+  const rule = mapping.catMap[category];
+  if(!rule || !rule.kind) return null;
+  if(rule.kind === 'acc') return (rule.accId && byId[rule.accId]) || null;
+  const accBranch = mapping.branchMap[branch];
+  if(!accBranch) return null;
+  const name = rule.kind === 'rev' ? (rule.activity+' - '+accBranch) : (rule.item+' - '+accBranch);
+  return byName[name] || null;
+}
+
 async function getLedgerMovements(from, to, branch){
   const tree = (await sGet('ks_chart_of_accounts')) || getDefaultChartOfAccounts();
   const flat = flattenAccounts(tree);
@@ -5468,13 +5538,14 @@ async function getLedgerMovements(from, to, branch){
   const brOk = b => !branch || branch==='all' || !b || b==='all' || b===branch;
   const acc = name => byName[name] || {id:'cat:'+name, name, type:''};
   const moves = [];
+  const mapping = await getAcctMapping();
 
   const treasury = ((await sGet('ks_treasury_entries'))||[]).filter(e=>!e.deleted && inRange(e.entryDate) && brOk(e.branch));
   treasury.forEach(e=>{
     const amt = Number(e.amount||0); if(!amt) return;
     const rt = e.receiptType||'وارد خزينة';
     const cash = acc(/بنك|فيزا|انستاباي|إنستاباي/.test(rt) ? 'بنك' : 'م / الخزينة');
-    const cat  = acc(e.category||'غير محدد');
+    const cat  = ksResolveMappedAccount(mapping, byName, byId, e.category||'', e.branch||'') || acc(e.category||'غير محدد');
     const inflow = treasuryReceiptSign(rt) > 0;
     const desc = e.statement || e.beneficiaryName || e.category || '';
     const base = {date:e.entryDate, desc, ref:e.receiptNo||'خزينة', source:'treasury', branch:e.branch||''};
@@ -5852,6 +5923,120 @@ async function renderPeriodReportTab(){
 // ═══════════════════════════════════════════════════════════
 //  📅 تبويب السنة المالية
 // ═══════════════════════════════════════════════════════════
+async function renderMappingTab(){
+  const mapping  = await getAcctMapping();
+  const tree     = (await sGet('ks_chart_of_accounts')) || getDefaultChartOfAccounts();
+  const flat     = flattenAccounts(tree);
+  const byName   = {}; flat.forEach(a=>{ if(!byName[a.name]) byName[a.name]=a; });
+  const byId     = {}; flat.forEach(a=>byId[a.id]=a);
+  const leafs    = flat.filter(a => !(a.children && a.children.length));
+  const tBranches= await getTreasuryBranches();
+  const entries  = ((await sGet('ks_treasury_entries'))||[]).filter(e=>!e.deleted);
+  const usedCats = [...new Set([...TREASURY_CATEGORIES, ...entries.map(e=>e.category).filter(Boolean)])];
+  const catCount = {}; entries.forEach(e=>{ catCount[e.category] = (catCount[e.category]||0)+1; });
+  const hasStructure = KS_ACC_BRANCHES.some(b => byName['Elite - '+b]);
+
+  // معاينة: كام حركة بتترحل على حساب فرع وكام لأ
+  let mapped = 0, unmapped = 0; const missing = {};
+  entries.forEach(e=>{
+    const a = ksResolveMappedAccount(mapping, byName, byId, e.category||'', e.branch||'');
+    if(a) mapped++;
+    else { unmapped++; const k = (e.category||'غير محدد')+' | '+(e.branch||'بدون فرع'); missing[k]=(missing[k]||0)+1; }
+  });
+  const missTop = Object.entries(missing).sort((a,b)=>b[1]-a[1]).slice(0,10);
+
+  const brOpts = v => '<option value="">— مش مربوط —</option>' + KS_ACC_BRANCHES.map(b=>`<option ${v===b?'selected':''}>${b}</option>`).join('');
+  const catRow = (c) => {
+    const r = mapping.catMap[c] || {kind:''};
+    return `<tr style="border-top:1px solid rgba(255,255,255,0.05);" data-cat="${c.replace(/"/g,'&quot;')}">
+      <td style="padding:8px 10px; font-weight:700;">${c} <span class="muted" style="font-size:11px;">${catCount[c]?'('+catCount[c]+')':''}</span></td>
+      <td style="padding:6px;"><select class="mpKind" onchange="ksMapKindChange(this)" style="min-width:120px;">
+        <option value="" ${!r.kind?'selected':''}>— بدون —</option>
+        <option value="rev" ${r.kind==='rev'?'selected':''}>إيراد نشاط</option>
+        <option value="exp" ${r.kind==='exp'?'selected':''}>مصروف فرع</option>
+        <option value="acc" ${r.kind==='acc'?'selected':''}>حساب محدد</option>
+      </select></td>
+      <td style="padding:6px;">
+        <select class="mpAct" style="display:${r.kind==='rev'?'':'none'};">${KS_ACC_ACTIVITIES.map(a=>`<option ${r.activity===a?'selected':''}>${a}</option>`).join('')}</select>
+        <select class="mpItem" style="display:${r.kind==='exp'?'':'none'};">${KS_ACC_EXP_ITEMS.map(a=>`<option ${r.item===a?'selected':''}>${a}</option>`).join('')}</select>
+        <select class="mpAcc" style="display:${r.kind==='acc'?'':'none'}; max-width:260px;"><option value="">اختار حساب</option>${leafs.map(a=>`<option value="${a.id}" ${r.accId===a.id?'selected':''}>${a.code?a.code+' - ':''}${a.name}</option>`).join('')}</select>
+      </td>
+    </tr>`;
+  };
+
+  return `
+  ${!hasStructure ? `<div class="card" style="padding:14px 16px; margin-bottom:14px; background:rgba(255,200,0,0.08); border:1px solid rgba(255,200,0,0.3);">
+    ⚠️ هيكل الفروع (Elite/Private/Group/Strokes ومصروفات كل فرع) مش موجود في شجرتك — لازم يتضاف الأول عشان الربط يشتغل.
+    <button class="btn btn-primary btn-sm" style="margin-right:10px;" onclick="mergeBranchStructure()">🏢 إضافة هيكل الفروع</button></div>` : ''}
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:14px;">
+    <div class="card" style="padding:14px 16px;"><div class="muted" style="font-size:12px;">حركات بتترحل على حسابات الفروع</div><div style="font-size:24px; font-weight:900; color:var(--ok);">${mapped}</div></div>
+    <div class="card" style="padding:14px 16px;"><div class="muted" style="font-size:12px;">حركات لسه على اسم التصنيف</div><div style="font-size:24px; font-weight:900; color:${unmapped?'var(--warn)':'var(--ok)'};">${unmapped}</div></div>
+  </div>
+
+  <div class="card" style="padding:16px 18px; margin-bottom:14px;">
+    <div style="font-weight:800; margin-bottom:4px;">🏢 فروع الخزينة ← الفروع المحاسبية</div>
+    <p class="muted" style="font-size:12.5px; margin-bottom:10px;">كل فرع في الخزينة بيتجمع تحت أنهي فرع من الـ ${KS_ACC_BRANCHES.length} في المحاسبة.</p>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:8px 16px;">
+      ${tBranches.map(b=>`<div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <span style="font-weight:700; font-size:13px;">${b}</span>
+        <select class="mpBranch" data-b="${b.replace(/"/g,'&quot;')}" style="min-width:140px;">${brOpts(mapping.branchMap[b]||'')}</select>
+      </div>`).join('')}
+    </div>
+  </div>
+
+  <div class="card" style="padding:16px 18px; margin-bottom:14px;">
+    <div style="font-weight:800; margin-bottom:4px;">🏷️ تصنيفات الخزينة ← الحسابات</div>
+    <p class="muted" style="font-size:12.5px; margin-bottom:10px;">
+      <b>إيراد نشاط</b>: بيترحل على "النشاط - الفرع" (مثلاً Elite - دايموند). ·
+      <b>مصروف فرع</b>: على "البند - الفرع" (مثلاً رواتب - المعادي). ·
+      <b>حساب محدد</b>: على حساب واحد ثابت مهما كان الفرع.</p>
+    <div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:13px;">
+      <thead><tr style="background:rgba(255,255,255,0.04);"><th style="padding:8px 10px; text-align:right;">التصنيف</th><th style="padding:8px;">نوع الربط</th><th style="padding:8px;">الحساب</th></tr></thead>
+      <tbody id="mpCats">${usedCats.map(catRow).join('')}</tbody>
+    </table></div>
+  </div>
+
+  ${missTop.length ? `<div class="card" style="padding:14px 16px; margin-bottom:14px;">
+    <div style="font-weight:800; font-size:13px; margin-bottom:6px;">📋 أكتر حركات لسه مش مربوطة (تصنيف | فرع)</div>
+    ${missTop.map(([k,n])=>`<div style="font-size:12.5px; padding:3px 0; color:var(--paper-dim);">${k} — ${n} حركة</div>`).join('')}
+  </div>` : ''}
+
+  <div style="display:flex; gap:10px; flex-wrap:wrap;">
+    <button class="btn btn-primary" onclick="saveAcctMapping()">💾 حفظ الربط</button>
+    <button class="btn btn-ghost" onclick="resetAcctMapping()">↺ رجوع للإعدادات المقترحة</button>
+  </div>
+  <p class="muted" style="font-size:12px; margin-top:10px;">الربط بيأثر على: شجرة الحسابات وأرصدتها، تقرير بالفترة، كشف حساب أي حساب، وإقفال السنة المالية. حركات الخزينة نفسها مش بتتغير.</p>`;
+}
+function ksMapKindChange(sel){
+  const tr = sel.closest('tr');
+  tr.querySelector('.mpAct').style.display  = sel.value==='rev'?'':'none';
+  tr.querySelector('.mpItem').style.display = sel.value==='exp'?'':'none';
+  tr.querySelector('.mpAcc').style.display  = sel.value==='acc'?'':'none';
+}
+async function saveAcctMapping(){
+  const branchMap = {}, catMap = {};
+  document.querySelectorAll('.mpBranch').forEach(s=>{ if(s.value) branchMap[s.dataset.b] = s.value; });
+  document.querySelectorAll('#mpCats tr').forEach(tr=>{
+    const kind = tr.querySelector('.mpKind').value; if(!kind) return;
+    const r = {kind};
+    if(kind==='rev') r.activity = tr.querySelector('.mpAct').value;
+    if(kind==='exp') r.item = tr.querySelector('.mpItem').value;
+    if(kind==='acc'){ r.accId = tr.querySelector('.mpAcc').value; if(!r.accId) return; }
+    catMap[tr.dataset.cat] = r;
+  });
+  await sSet('ks_acct_mapping', {branchMap, catMap, updatedAt:new Date().toISOString(), by:session.name});
+  showToast('✅ اتحفظ الربط');
+  renderPage();
+}
+async function resetAcctMapping(){
+  if(!confirm('ترجع الربط للإعدادات المقترحة؟')) return;
+  await sDel('ks_acct_mapping');
+  window._memCache && delete window._memCache['ks_acct_mapping'];
+  showToast('↺ رجع للإعدادات المقترحة');
+  renderPage();
+}
+
 async function renderFiscalTab(){
   const fys = await getFiscalYears();
   const active = await getActiveFY();
@@ -7683,7 +7868,9 @@ async function submitAddStaff(e) {
   await sSet('ks_players', players);
   await sSet('ks_perms_'+newU.id, []);
   if(ksIsActivatableStaff(newU)){
-    try { await ksProvisionStaff(newU, pinText); } catch(err){ showToast('⚠️ الحساب اتعمل بس الدخول ماتفعلش: '+(err.code||err.message)); }
+    try {
+      if(await ksProvisionStaff(newU, pinText)){ delete newU.pinText; await sSet('ks_players', players); }
+    } catch(err){ showToast('⚠️ الحساب اتعمل بس الدخول ماتفعلش: '+(err.code||err.message)); }
   }
   
   closeModal();
@@ -7791,18 +7978,25 @@ async function submitEditStaff(e, staffId) {
   }
   
   const newPin = document.getElementById('esPin').value.trim();
+  let wasActive = false;
+  if(ksIsActivatableStaff(staff) && ksAuthActive()){
+    try { wasActive = !!(await window.ksAuth.getLogin(await ksUserHash(_oldUsername))); } catch(e){}
+  }
+  if(wasActive && _oldUsername !== staff.username && !newPin && !staff.pinText){
+    staff.username = _oldUsername;
+    showToast('⚠️ عشان تغيّر اسم المستخدم لحساب مفعّل، اكتب له رقم سري جديد كمان');
+    return false;
+  }
   if (newPin) { 
     staff.pinHash = await sha256(newPin);
-    staff.pinText = newPin;
+    if(!wasActive) staff.pinText = newPin; else delete staff.pinText;
   }
   
-  await sSet('ks_players', players);
-  if(ksIsActivatableStaff(staff) && (newPin || _oldUsername !== staff.username)){
-    try {
-      const wasActive = ksAuthActive() && await window.ksAuth.getLogin(await ksUserHash(_oldUsername));
-      if(wasActive) await ksProvisionStaff(staff, staff.pinText, _oldUsername);
-    } catch(err){ showToast('⚠️ البيانات اتحفظت بس حساب الدخول ماتحدثش: '+(err.code||err.message)); }
+  if(wasActive && (newPin || _oldUsername !== staff.username)){
+    try { await ksProvisionStaff(staff, newPin || staff.pinText, _oldUsername); delete staff.pinText; }
+    catch(err){ showToast('⚠️ حساب الدخول ماتحدثش: '+(err.code||err.message)+' — ماتغيرش حاجة'); return false; }
   }
+  await sSet('ks_players', players);
   closeModal();
   showToast('تم تحديث بيانات الحساب بنجاح ✅');
   renderPage();
