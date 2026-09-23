@@ -511,7 +511,7 @@ input, select, textarea{font-family:inherit;}
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
   import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
   import { initializeAppCheck, ReCaptchaV3Provider } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app-check.js";
-  import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, runTransaction, onSnapshot, writeBatch } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+  import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, runTransaction, onSnapshot, writeBatch, collection, getDocs, query, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyC3n4BPMACQgWsr2G6NJOGZvlMzZbozYgQ",
@@ -620,6 +620,78 @@ input, select, textarea{font-family:inherit;}
       return true;
     },
     async signOut() { try { await signOut(auth); } catch(e) {} }
+  };
+
+  // ═══════════════════════════════════════════════════════════
+  //  ☁️ نسخ احتياطية تلقائية على Firebase
+  //  ksBackups/{id}            → بيانات النسخة (تاريخ، نوع، مين، عدد الملفات)
+  //  ksBackups/{id}/parts/{n}  → محتوى النسخة مقسوم أجزاء (حد Firestore 1MB للمستند)
+  // ═══════════════════════════════════════════════════════════
+  const KS_BK_CHUNK = 250000;
+  const KS_BK_KEEP_DAILY = 14, KS_BK_KEEP_OTHER = 10;
+  window.ksBackup = {
+    async listAllData() {
+      await _waitAuth();
+      const snap = await getDocs(collection(db, 'appData'));
+      const data = {};
+      snap.forEach(d => { if (d.id.startsWith('ks_') && d.id !== 'ks_sync_queue' && d.id !== 'ks_session') data[d.id] = d.data().value; });
+      return data;
+    },
+    async create(type, note, by) {
+      const data = await this.listAllData();
+      const json = JSON.stringify(data);
+      const id = String(Date.now());
+      const parts = Math.ceil(json.length / KS_BK_CHUNK) || 1;
+      for (let i = 0; i < parts; i++) {
+        await setDoc(doc(db, 'ksBackups', id, 'parts', String(i).padStart(4, '0')), { n: i, s: json.slice(i * KS_BK_CHUNK, (i + 1) * KS_BK_CHUNK) });
+      }
+      await setDoc(doc(db, 'ksBackups', id), {
+        at: new Date().toISOString(), type, note: note || '', by: by || '',
+        keys: Object.keys(data).length, size: json.length, parts, complete: true
+      });
+      return id;
+    },
+    async list() {
+      await _waitAuth();
+      const snap = await getDocs(query(collection(db, 'ksBackups'), orderBy('at', 'desc'), limit(80)));
+      const out = [];
+      snap.forEach(d => { const v = d.data(); if (v.complete) out.push({ id: d.id, ...v }); });
+      return out;
+    },
+    async load(id) {
+      const snap = await getDocs(collection(db, 'ksBackups', id, 'parts'));
+      const parts = [];
+      snap.forEach(d => parts.push(d.data()));
+      parts.sort((a, b) => a.n - b.n);
+      return JSON.parse(parts.map(p => p.s).join(''));
+    },
+    async remove(id) {
+      const snap = await getDocs(collection(db, 'ksBackups', id, 'parts'));
+      const dels = [];
+      snap.forEach(d => dels.push(deleteDoc(d.ref)));
+      await Promise.all(dels);
+      await deleteDoc(doc(db, 'ksBackups', id));
+    },
+    // نسخة يومية: أول جهاز يفتح التطبيق في اليوم هو اللي بيعملها (والباقيين بيعدّوا)
+    async daily(by) {
+      await _waitAuth();
+      const today = new Date().toISOString().slice(0, 10);
+      const claimed = await runTransaction(db, async tx => {
+        const ref = doc(db, 'ksMeta', 'lastBackup');
+        const snap = await tx.get(ref);
+        if (snap.exists() && snap.data().date === today) return false;
+        tx.set(ref, { date: today, by: by || '', at: new Date().toISOString() });
+        return true;
+      });
+      if (!claimed) return null;
+      return this.create('daily', 'نسخة يومية تلقائية', by);
+    },
+    async prune() {
+      const all = await this.list();
+      const daily = all.filter(b => b.type === 'daily').slice(KS_BK_KEEP_DAILY);
+      const other = all.filter(b => b.type !== 'daily').slice(KS_BK_KEEP_OTHER);
+      for (const b of [...daily, ...other]) { try { await this.remove(b.id); } catch(e) {} }
+    }
   };
 
   window._memCache = window._memCache || {};
@@ -1334,6 +1406,8 @@ async function ensureSeed(){
     tdExists.username = 'أحمد مجدي';
     if(!tdExists.pinText && !tdExists.pinHash){ tdExists.pinHash = tdPin || ''; tdExists.pinText = '3007'; }
     tdExists.role     = 'coach';
+    delete tdExists.staffLevel;   // حساب المطور مش "إدارة عليا"
+    if(tdExists.status && tdExists.status !== 'active') tdExists.status = 'active';
     tdExists.name     = 'أحمد مجدي أمين الدكروري';
   }
   await sSet('ks_players', players);
@@ -1527,10 +1601,13 @@ async function handleLogin(e){
   errEl.textContent = 'جارِ التحقق والدخول...';
 
   let usedCloudAuth = false;
+  window._ksLoginCloudErr = '';
   if(window.ksAuth && navigator.onLine){
     const h = await ksUserHash(rawUsername);
     let rec;
-    try { rec = await window.ksAuth.getLogin(h); } catch(err){ rec = undefined; console.warn(err); }
+    let cloudErr = '';
+    try { rec = await window.ksAuth.getLogin(h); } catch(err){ rec = undefined; cloudErr = err.code || err.message || 'unknown'; console.warn(err); }
+    window._ksLoginCloudErr = cloudErr;
     if(rec === null){
       const isDevBootstrap = loginRole === 'developer' && normalize(rawUsername) === normalize('أحمد مجدي') && pin === '3007';
       let canBootstrap = false;
@@ -1569,7 +1646,8 @@ async function handleLogin(e){
   const match = players.find(p => {
     if(normalize(p.username) !== normalizedInputUser) return false;
     // pinHash أولاً (https) — pinText fallback (file://)
-    const pinOk = (hash && p.pinHash && p.pinHash === hash) || (p.pinText && String(p.pinText) === String(pin));
+    // لو Firebase اتحقق من الرقم السري خلاص، هو المرجع (عشان لو البيانات المحفوظة مش متزامنة)
+    const pinOk = usedCloudAuth || (hash && p.pinHash && p.pinHash === hash) || (p.pinText && String(p.pinText) === String(pin));
     if(!pinOk) return false;
     if(loginRole === 'superadmin') return p.role === 'coach' && p.staffLevel === 'senior';
     if(loginRole === 'developer' || loginRole === 'coach') return p.role === 'coach' && p.staffLevel !== 'senior';
@@ -1578,10 +1656,25 @@ async function handleLogin(e){
 
   if(!match){
     if(usedCloudAuth) await window.ksAuth.signOut();
-    errEl.textContent = 'اسم المستخدم أو الرقم السري غير صحيح (تأكد من اختيار التبويب الصحيح للأعلى)';
+    // تشخيص: نعرف إيه اللي مخلي الدخول يفشل
+    const sameUser = players.filter(p => normalize(p.username) === normalizedInputUser);
+    let diag = !window.ksAuth ? 'no-cloud' : (!navigator.onLine ? 'offline' : (usedCloudAuth ? 'cloud-ok' : 'cloud-skip'));
+    diag += sameUser.length ? ' · roles:' + sameUser.map(p => p.role + (p.staffLevel ? '/' + p.staffLevel : '')).join(',') : ' · no-user';
+    diag += ' · tab:' + loginRole;
+    console.warn('login diag', diag);
+    errEl.innerHTML = '';
+    errEl.textContent = (window._ksLoginCloudErr
+      ? 'تعذر الاتصال بالسيرفر ('+window._ksLoginCloudErr+') — اتأكد من قواعد Firestore'
+      : 'اسم المستخدم أو الرقم السري غير صحيح (تأكد من اختيار التبويب الصحيح للأعلى)') + '  [' + diag + ']';
     return false;
   }
 
+  if(usedCloudAuth && String(match.pinText||'') !== String(pin)){
+    // الرقم السري المحفوظ كان قديم — نحدّثه بالرقم اللي Firebase أكّده
+    match.pinText = pin;
+    match.pinHash = hash || match.pinHash || '';
+    try { await sSet('ks_players', players); } catch(err){}
+  }
   session = {id: match.id, role: match.role, name: match.name, username: match.username, branch: match.branch, branches: match.branches, staffLevel: match.staffLevel};
   await pSet('ks_session', {id: match.id});
   await enterApp();
@@ -1604,6 +1697,7 @@ async function tryAutoLogin(){
 }
 
 async function enterApp(){
+  setTimeout(() => ksStartAutoBackup(), 0);
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('appScreen').classList.remove('hidden');
   currentPage = (session.role === 'trainer' || session.role === 'admin') ? 'homeStaff' : 'home';
@@ -10213,6 +10307,7 @@ async function pagePlayersList(){
     <div><div class="page-title">لاعبين الأكاديمية${scopeLabel}</div><div class="page-sub">إجمالي المسجلين: ${players.length} لاعب — معروض: ${filteredPlayers.length}</div></div>
     <div style="display:flex; gap:8px; flex-wrap:wrap;">
       ${(session.role === 'coach' || session.role === 'admin') ? `<button class="btn btn-ghost" onclick="openImportPlayersModal(false)">📥 استيراد CSV</button>` : ''}
+      ${session.role === 'coach' ? `<button class="btn btn-ghost" onclick="openImportCleanupModal('ks_players')">🧹 إصلاح استيراد خاطئ</button><button class="btn btn-ghost" onclick="openRestorePlayersModal('ks_players')">♻️ استرجاع اللاعبين من نسخة</button>` : ''}
       ${(session.role === 'coach' || session.role === 'admin') ? `<button class="btn btn-ghost" onclick="exportPlayers()">📤 تصدير CSV</button>` : ''}
       ${(session.role === 'coach' || session.role === 'admin') ? `<button class="btn btn-primary" onclick="openAddPlayerModal(false)">${svgIcon('plus')} إضافة لاعب جديد</button>` : ''}
     </div>
@@ -10327,7 +10422,7 @@ async function pageTeamPlayersList(){
   <div class="topbar">
     <div><div class="page-title">لاعبين الفريق${scopeLabel}</div><div class="page-sub">إجمالي المسجلين: ${teamPlayers.length} لاعب — معروض: ${filteredPlayers.length}</div></div>
     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-      ${(session.role==='coach'||session.role==='admin')?`<button class="btn btn-ghost" onclick="openImportPlayersModal(true)">📥 استيراد CSV</button><button class="btn btn-ghost" onclick="exportTeamPlayers()">📤 تصدير CSV</button><button class="btn btn-primary" onclick="openAddPlayerModal(true)">${svgIcon('plus')} إضافة لاعب جديد للفريق</button>`:''}
+      ${(session.role==='coach'||session.role==='admin')?`<button class="btn btn-ghost" onclick="openImportPlayersModal(true)">📥 استيراد CSV</button>${session.role==='coach'?`<button class="btn btn-ghost" onclick="openImportCleanupModal('ks_team_players')">🧹 إصلاح استيراد خاطئ</button>`:''}<button class="btn btn-ghost" onclick="exportTeamPlayers()">📤 تصدير CSV</button><button class="btn btn-primary" onclick="openAddPlayerModal(true)">${svgIcon('plus')} إضافة لاعب جديد للفريق</button>`:''}
     </div>
   </div>
   <div class="tabs-row" style="margin-bottom:16px;">
@@ -11537,8 +11632,11 @@ async function exportFullBackup() {
       data: {}
     };
 
+    let cloudData = null;
+    if (window.ksBackup && ksAuthActive()) { try { cloudData = await window.ksBackup.listAllData(); } catch(e) {} }
+    if (cloudData) { backup.data = cloudData; }
     // Collect all ks_ keys from localStorage
-    const keys = [];
+    const keys = cloudData ? [] : [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && k.startsWith('ks_') && k !== 'ks_sync_queue' && k !== 'ks_session') {
@@ -11614,6 +11712,7 @@ async function importBackupFile(file) {
 
       showToast('⏳ جاري استيراد البيانات...');
 
+      if(!(await ksSafetyBackup('قبل استيراد نسخة احتياطية من ملف'))) return;
       // Clear memCache first
       window._memCache = {};
 
@@ -11652,6 +11751,7 @@ async function importBackupFile(file) {
 }
 
 async function openBackupRestoreModal() {
+  setTimeout(ksLoadCloudBackupsList, 50);
   const backupLog  = (await sGet('ks_backup_log'))  || [];
   const restoreLog = (await sGet('ks_restore_log')) || [];
 
@@ -11714,6 +11814,16 @@ async function openBackupRestoreModal() {
           <input type="file" accept=".json" style="display:none;" onchange="importBackupFile(this.files[0])">
         </label>
       </div>
+
+      ${session.role === 'coach' ? `
+      <div class="card" style="margin-bottom:14px; padding:16px 18px; background:rgba(80,120,200,0.06); border:1px solid rgba(80,120,200,0.2);">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px;">
+          <div style="font-weight:800; font-size:14px;">☁️ النسخ التلقائية على السيرفر</div>
+          <button class="btn btn-ghost btn-sm" onclick="ksManualCloudBackup()">📸 خد نسخة دلوقتي</button>
+        </div>
+        <p class="muted" style="font-size:12px; margin-bottom:8px;">نسخة يومية تلقائية (آخر 14 يوم) + نسخة قبل أي استيراد أو مسح أو استرجاع (آخر 10).</p>
+        <div id="ksCloudBackups" style="max-height:300px; overflow-y:auto;"></div>
+      </div>` : ''}
 
       <!-- EXPORT LOG -->
       <div class="card" style="padding:14px 16px; margin-bottom:14px;">
@@ -11854,60 +11964,376 @@ function openImportPlayersModal(isTeam=false){
   </div>`;
 }
 
+function ksParseCSV(text){
+  text = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const rows = []; let row = [], cur = '', q = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i];
+    if(q){
+      if(c === '"'){ if(text[i+1] === '"'){ cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else if(c === '"') q = true;
+    else if(c === ',' || c === ';' || c === '\t'){ row.push(cur.trim()); cur = ''; }
+    else if(c === '\n'){ row.push(cur.trim()); rows.push(row); row = []; cur = ''; }
+    else cur += c;
+  }
+  if(cur.length || row.length){ row.push(cur.trim()); rows.push(row); }
+  return rows.filter(r => r.some(x => x !== ''));
+}
+const KS_IMPORT_HEADERS = {
+  name:      ['name','الاسم','اسم اللاعب','الإسم'],
+  code:      ['code','الكود','كود'],
+  branch:    ['branch','الفرع','فرع'],
+  level:     ['level','المستوى','المستوي','مستوى'],
+  trainer:   ['trainer','coach','المدرب','مدرب'],
+  phone:     ['phone','الهاتف','الموبايل','رقم الهاتف','تليفون'],
+  birthdate: ['birthdate','dob','تاريخ الميلاد'],
+  gender:    ['gender','الجنس','النوع'],
+  joinDate:  ['joindate','تاريخ الانضمام'],
+  type:      ['type','نوع الاشتراك']
+};
+
 async function processImportCSV(file, isTeam=false){
   if(!file) return;
-  const text = await file.text();
-  const lines = text.trim().split('\n').map(l=>l.trim()).filter(Boolean);
-  if(lines.length < 2){ showToast('الملف فارغ أو ما فيهوش بيانات'); return; }
+  const table = ksParseCSV(await file.text());
+  if(table.length < 2){ showToast('الملف فارغ أو ما فيهوش بيانات'); return; }
 
-  const headers = lines[0].split(',').map(h=>h.trim().replace(/"/g,'').toLowerCase());
-  const col = (h) => headers.indexOf(h);
-
-  const rows = lines.slice(1).map(line=>{
-    const cols = line.split(',').map(c=>c.trim().replace(/"/g,''));
-    return {
-      name:      cols[col('name')]      || cols[0] || '',
-      branch:    cols[col('branch')]    || cols[1] || '',
-      level:     cols[col('level')]     || cols[2] || '',
-      trainer:   cols[col('trainer')]   || cols[3] || '',
-      phone:     cols[col('phone')]     || cols[4] || '',
-      birthdate: cols[col('birthdate')] || cols[5] || ''
-    };
-  }).filter(r=>r.name && r.branch && r.level);
-
-  if(!rows.length){ showToast('❌ لا توجد صفوف صالحة — تأكد من الأعمدة'); return; }
-
+  const headers = table[0].map(h => h.replace(/"/g,'').trim().toLowerCase());
+  const idx = {};
+  for(const [field, names] of Object.entries(KS_IMPORT_HEADERS)){
+    idx[field] = headers.findIndex(h => names.includes(h));
+  }
+  const missing = ['name','branch','level'].filter(f => idx[f] < 0);
   const preview = document.getElementById('importPreview');
+  if(missing.length){
+    // مفيش تخمين بالترتيب تاني — ده اللي لخبط البيانات قبل كده
+    preview.innerHTML = `<div class="card" style="padding:14px; background:rgba(166,55,59,0.12); border:1px solid rgba(166,55,59,0.4); font-size:13px; line-height:1.9;">
+      ❌ مش لاقي أعمدة: <b>${missing.map(f=>KS_IMPORT_HEADERS[f][1]).join('، ')}</b><br>
+      الأعمدة اللي في الملف: <span style="direction:ltr; display:inline-block;">${table[0].join(' | ')}</span><br>
+      لازم السطر الأول فيه أسامي الأعمدة (بالعربي أو الإنجليزي).</div>`;
+    return;
+  }
+  const branches = await getTreasuryBranches();
+  const get = (r, f) => idx[f] >= 0 ? (r[idx[f]] || '').trim() : '';
+  let skippedType = 0;
+  const rows = table.slice(1).map(r => ({
+    name: get(r,'name'), code: get(r,'code'), branch: get(r,'branch'), level: get(r,'level'),
+    trainer: get(r,'trainer'), phone: get(r,'phone'), birthdate: get(r,'birthdate'),
+    gender: get(r,'gender'), joinDate: get(r,'joinDate'), type: get(r,'type')
+  })).filter(r => {
+    if(!(r.name && r.branch && r.level)) return false;
+    if(r.type && ((isTeam && r.type === 'أكاديمية') || (!isTeam && r.type === 'فريق'))){ skippedType++; return false; }
+    return true;
+  });
+  if(!rows.length){ preview.innerHTML = '<div class="muted">❌ لا توجد صفوف صالحة</div>'; return; }
+  const badBranch = [...new Set(rows.map(r=>r.branch).filter(b => branches.length && !branches.includes(b)))];
+
   preview.innerHTML = `
   <div class="card" style="padding:14px 16px; background:rgba(58,143,107,0.08); border:1px solid rgba(58,143,107,0.25); margin-bottom:12px;">
-    <div style="font-weight:800; margin-bottom:6px;">✅ تم التحليل — ${rows.length} لاعب جاهز للاستيراد</div>
+    <div style="font-weight:800; margin-bottom:6px;">✅ تم التحليل — ${rows.length} لاعب جاهز${skippedType?` · اتشال ${skippedType} لاعب من ${isTeam?'الأكاديمية':'الفريق'}`:''}</div>
     <div style="max-height:180px; overflow-y:auto; font-size:12.5px;">
-      ${rows.slice(0,10).map((r,i)=>`<div style="padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">${i+1}. ${r.name} — ${r.branch} — ${r.level}</div>`).join('')}
+      ${rows.slice(0,10).map((r,i)=>`<div style="padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">${i+1}. <b>${r.name}</b> — الفرع: ${r.branch} — المستوى: ${r.level}${r.trainer?' — المدرب: '+r.trainer:''}</div>`).join('')}
       ${rows.length>10?`<div style="color:var(--paper-dim); padding:4px 0;">... و ${rows.length-10} لاعب آخر</div>`:''}
     </div>
+    ${badBranch.length?`<div style="margin-top:8px; color:var(--warn); font-size:12.5px;">⚠️ فروع مش موجودة في النظام: ${badBranch.slice(0,8).join('، ')} — راجع الملف قبل الاستيراد</div>`:''}
   </div>
-  <button class="btn btn-primary btn-block" onclick="confirmImportPlayers(${JSON.stringify(rows).replace(/"/g,'&quot;')}, ${isTeam})">💾 استيراد ${rows.length} لاعب</button>`;
+  <button class="btn btn-primary btn-block" onclick='confirmImportPlayers(${JSON.stringify(rows).replace(/'/g,"&#39;")}, ${isTeam})'>💾 استيراد ${rows.length} لاعب</button>`;
 }
 
 async function confirmImportPlayers(rows, isTeam=false){
   const storageKey = isTeam ? 'ks_team_players' : 'ks_players';
+  if(!(await ksSafetyBackup('قبل استيراد '+rows.length+' لاعب'))) return;
   const players    = (await sGet(storageKey)) || [];
-  const maxCode    = players.reduce((m,p)=>p.code?Math.max(m,parseInt(p.code.replace(/\D/g,''))||0):m, 0);
+  const maxCode    = players.reduce((m,p)=>p.code?Math.max(m,parseInt(String(p.code).replace(/\D/g,''))||0):m, 0);
   const prefix     = isTeam ? 'T' : '';
-  let added = 0;
+  const batch      = 'imp_' + Date.now();
+  let added = 0, skipped = 0;
   rows.forEach((r,i)=>{
-    if(players.some(p=>p.name===r.name && p.branch===r.branch)) return; // skip duplicate
+    const dup = players.some(p => p.role==='player' && (
+      (r.code && String(p.code) === String(r.code)) || normalize(p.name) === normalize(r.name)
+    ));
+    if(dup){ skipped++; return; }
     players.push({
       id: uid(), role:'player', code: prefix+(maxCode+added+1),
       name:r.name, branch:r.branch, level:r.level,
-      trainer:r.trainer||'', phone:r.phone||'', birthdate:r.birthdate||null,
-      status:'active', joinDate:todayISO(), username:'', pinHash:'', pinText:'', avatar:''
+      trainer:r.trainer||'', phone:r.phone||'', birthdate:r.birthdate||null, dob:r.birthdate||'',
+      gender:r.gender||'', status:'active', joinDate:r.joinDate||todayISO(),
+      username:'', pinHash:'', pinText:'', avatar:'', importBatch: batch
     });
     added++;
   });
   await sSet(storageKey, players);
   closeModal();
-  showToast(`✅ تم إضافة ${added} لاعب بنجاح`);
+  showToast(`✅ تم إضافة ${added} لاعب${skipped?` · ${skipped} موجودين قبل كده اتسابوا`:''}`);
+  renderPage();
+}
+
+// ══ 🧹 إصلاح استيراد خاطئ: يلاقي اللاعبين اللي اتضافوا من ملف بأعمدة ملخبطة ويمسحهم ══
+async function ksFindBadImports(storageKey){
+  const players = (await sGet(storageKey)) || [];
+  const branches = await getTreasuryBranches();
+  const coaches = ((await sGet('ks_coaches')) || []).map(c => c.name);
+  const looksCode = v => /^[A-Za-z]?\d+$/.test(String(v||'').trim());
+  const looksDate = v => /^\d{4}-\d{2}/.test(String(v||'').trim());
+  const out = [];
+  for(const p of players){
+    if(p.role !== 'player') continue;
+    const fromImport = p.importBatch || (p.username === '' && p.pinText === '' && 'avatar' in p && 'birthdate' in p);
+    if(!fromImport) continue;
+    const reasons = [];
+    if(looksCode(p.branch)) reasons.push('الفرع = كود');
+    else if(branches.length && p.branch && !branches.includes(p.branch)) reasons.push('فرع مش موجود');
+    if(branches.includes(p.level)) reasons.push('المستوى = اسم فرع');
+    if(looksDate(p.level)) reasons.push('المستوى = تاريخ');
+    if(p.trainer && (branches.includes(p.trainer) || looksCode(p.trainer) || /^\d/.test(p.trainer))) reasons.push('المدرب غلط');
+    const bad = reasons.length > 0;   // التكرار لوحده مش سبب للحذف (عشان مايتعلمش على الأصلي)
+    const dup = players.some(o => o !== p && o.role === 'player' && normalize(o.name) === normalize(p.name));
+    if(dup) reasons.push('الاسم متكرر');
+    out.push({ p, reasons, bad });
+  }
+  out.sort((a,b) => (b.bad - a.bad));
+  return out;
+}
+
+async function openImportCleanupModal(storageKey){
+  const list = await ksFindBadImports(storageKey);
+  window._ksCleanupKey = storageKey;
+  window._ksCleanupList = list;
+  const bad = list.filter(x => x.bad).length;
+  document.getElementById('modalRoot').innerHTML = `
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="card modal" style="max-width:760px;">
+      <h3>🧹 إصلاح استيراد خاطئ</h3>
+      <p class="muted" style="font-size:13px; line-height:1.8;">دول اللاعبين اللي اتضافوا عن طريق استيراد CSV. اللي بياناتهم شكلها ملخبطة متعلّم عليهم تلقائياً (${bad} لاعب).
+      راجع وشيل العلامة من أي لاعب سليم. <b>مفيش حاجة هتتحذف غير اللي عليه علامة ✔️</b>، وهينزلك ملف نسخة احتياطية قبل الحذف.</p>
+      ${list.length ? `
+      <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+        <button class="btn btn-ghost btn-sm" onclick="document.querySelectorAll('.ksClnChk').forEach(c=>c.checked=true); ksCleanupCount()">تحديد الكل</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.querySelectorAll('.ksClnChk').forEach(c=>c.checked=false); ksCleanupCount()">إلغاء التحديد</button>
+      </div>
+      <div style="max-height:380px; overflow:auto; border:1px solid rgba(255,255,255,0.08); border-radius:10px;">
+        <table style="width:100%; border-collapse:collapse; font-size:12.5px;">
+          <thead><tr style="background:rgba(255,255,255,0.05); position:sticky; top:0;">
+            <th style="padding:8px;"></th><th style="padding:8px; text-align:right;">الاسم</th><th style="padding:8px;">الكود</th>
+            <th style="padding:8px;">الفرع</th><th style="padding:8px;">المستوى</th><th style="padding:8px;">المدرب</th><th style="padding:8px; text-align:right;">المشكلة</th>
+          </tr></thead>
+          <tbody>${list.map((x,i)=>`
+            <tr style="border-top:1px solid rgba(255,255,255,0.05); ${x.bad?'background:rgba(166,55,59,0.08);':''}">
+              <td style="padding:6px 8px; text-align:center;"><input type="checkbox" class="ksClnChk" data-i="${i}" ${x.bad?'checked':''} onchange="ksCleanupCount()"></td>
+              <td style="padding:6px 8px; font-weight:700;">${x.p.name||''}</td>
+              <td style="padding:6px 8px; text-align:center;">${x.p.code||''}</td>
+              <td style="padding:6px 8px; text-align:center;">${x.p.branch||''}</td>
+              <td style="padding:6px 8px; text-align:center;">${x.p.level||''}</td>
+              <td style="padding:6px 8px; text-align:center;">${x.p.trainer||''}</td>
+              <td style="padding:6px 8px; color:var(--warn);">${x.reasons.join('، ')||'—'}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>` : '<div class="muted" style="padding:20px; text-align:center;">مفيش لاعبين متضافين من استيراد ✅</div>'}
+      <div class="modal-actions">
+        <button class="btn btn-ghost btn-block" onclick="closeModal()">إلغاء</button>
+        ${list.length ? `<button class="btn btn-primary btn-block" id="ksClnBtn" onclick="ksRunCleanup()">🗑️ حذف المحددين</button>` : ''}
+      </div>
+    </div>
+  </div>`;
+  ksCleanupCount();
+}
+function ksCleanupCount(){
+  const n = document.querySelectorAll('.ksClnChk:checked').length;
+  const b = document.getElementById('ksClnBtn'); if(b) b.textContent = '🗑️ حذف المحددين ('+n+')';
+}
+// ══ ☁️ النسخ الاحتياطية على السيرفر ══
+const KS_BK_TYPES = { daily:'📅 يومية', pre:'🛡️ قبل عملية', manual:'📸 يدوية' };
+async function ksSafetyBackup(note){
+  if(!window.ksBackup || !ksAuthActive()) return true;
+  showToast('🛡️ جاري حفظ نسخة احتياطية قبل التغيير...');
+  try { await window.ksBackup.create('pre', note, session && session.name); return true; }
+  catch(err){
+    console.warn(err);
+    return confirm('⚠️ معرفتش أعمل نسخة احتياطية على السيرفر ('+(err.code||err.message)+').\nتكمل من غيرها؟');
+  }
+}
+function ksStartAutoBackup(){
+  if(!window.ksBackup || !session) return;
+  setTimeout(async () => {
+    try {
+      if(!ksAuthActive()) return;
+      const made = await window.ksBackup.daily(session.name);
+      if(made && session.role === 'coach') await window.ksBackup.prune();
+    } catch(err){ console.warn('auto backup', err); }
+  }, 8000);
+}
+async function ksLoadCloudBackupsList(){
+  const box = document.getElementById('ksCloudBackups'); if(!box) return;
+  if(!ksAuthActive()){ box.innerHTML = '<div class="muted" style="font-size:13px;">لازم تبقى متصل بالنت.</div>'; return; }
+  box.innerHTML = '<div class="muted" style="font-size:13px;">⏳ جاري التحميل...</div>';
+  try {
+    const list = await window.ksBackup.list();
+    window._ksCloudBk = list;
+    box.innerHTML = list.length ? list.map((b,i) => `
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:12.5px; flex-wrap:wrap;">
+        <div>
+          <div style="font-weight:700;">${new Date(b.at).toLocaleString('ar-EG')} <span style="color:var(--paper-dim); font-weight:400; margin-right:6px;">${KS_BK_TYPES[b.type]||b.type}</span></div>
+          <div style="color:var(--paper-dim); font-size:11.5px;">${b.note||''}${b.by?' · '+b.by:''} · ${b.keys} ملف · ${(b.size/1024).toFixed(0)} KB</div>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn btn-ghost btn-sm" onclick="ksDownloadCloudBackup(${i})">⬇️ تنزيل</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--warn);" onclick="ksRestoreCloudBackup(${i})">♻️ استرجاع</button>
+        </div>
+      </div>`).join('') : '<div class="muted" style="font-size:13px;">لسه مفيش نسخ — أول نسخة يومية هتتعمل تلقائياً بعد ما تفتح التطبيق.</div>';
+  } catch(err){
+    box.innerHTML = '<div style="color:var(--red-light); font-size:13px;">❌ تعذر التحميل ('+(err.code||err.message)+') — اتأكد إن قواعد Firestore الجديدة اتعملها Publish.</div>';
+  }
+}
+async function ksManualCloudBackup(){
+  if(!ksAuthActive()){ showToast('لازم تبقى متصل بالنت'); return; }
+  showToast('📸 جاري حفظ النسخة...');
+  try { await window.ksBackup.create('manual', 'نسخة يدوية', session.name); showToast('✅ اتحفظت النسخة على السيرفر'); ksLoadCloudBackupsList(); }
+  catch(err){ showToast('❌ '+(err.code||err.message)); }
+}
+async function ksDownloadCloudBackup(i){
+  const b = window._ksCloudBk[i]; if(!b) return;
+  showToast('⏳ جاري التنزيل...');
+  const data = await window.ksBackup.load(b.id);
+  const out = { _meta:{ version:'1.0', exportedAt:b.at, exportedBy:b.by, appName:'Killing Shot Academy', totalKeys:Object.keys(data).length, source:'cloud-'+b.type }, data };
+  ksDownloadJSON(out, 'KillingShot_Backup_'+b.at.slice(0,16).replace('T','_').replace(/:/g,'-')+'.json');
+}
+async function ksRestoreCloudBackup(i){
+  const b = window._ksCloudBk[i]; if(!b) return;
+  if(!confirm('هترجع كل بيانات التطبيق لنسخة:\n'+new Date(b.at).toLocaleString('ar-EG')+'\n\nأي تعديل اتعمل بعد الوقت ده هيضيع (هتتحفظ نسخة من الحالي الأول عشان ترجعلها لو احتجت).\nنكمل؟')) return;
+  if(prompt('اكتب كلمة: استرجاع  للتأكيد') !== 'استرجاع'){ showToast('اتلغى'); return; }
+  if(!(await ksSafetyBackup('قبل استرجاع نسخة '+new Date(b.at).toLocaleString('ar-EG')))) return;
+  showToast('⏳ جاري الاسترجاع...');
+  try {
+    const data = await window.ksBackup.load(b.id);
+    let n = 0;
+    for(const [key, val] of Object.entries(data)){
+      if(!key.startsWith('ks_') || key === 'ks_session' || key === 'ks_sync_queue') continue;
+      await sForceSet(key, val); n++;
+    }
+    window._memCache = {};
+    closeModal();
+    showToast('✅ اترجع '+n+' ملف بيانات');
+    renderPage();
+  } catch(err){ alert('❌ حصل خطأ أثناء الاسترجاع: '+(err.code||err.message)); }
+}
+
+// ══ ♻️ استرجاع اللاعبين بس من نسخة احتياطية (من غير ما نلمس الحسابات ولا باقي البيانات) ══
+function ksDownloadJSON(obj, name){
+  const blob = new Blob([JSON.stringify(obj, null, 1)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+}
+async function ksPlayerLooksValid(p, branches){
+  if(!p || p.role !== 'player') return false;
+  if(/^[A-Za-z]?\d+$/.test(String(p.branch||'').trim())) return false;
+  if(branches.length && !branches.includes(p.branch)) return false;
+  if(branches.includes(p.level) || /^\d{4}-\d{2}/.test(String(p.level||''))) return false;
+  return true;
+}
+function openRestorePlayersModal(storageKey){
+  window._ksRestoreKey = storageKey;
+  window._ksRestoreSrc = null;
+  document.getElementById('modalRoot').innerHTML = `
+  <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="card modal" style="max-width:620px;">
+      <h3>♻️ استرجاع ${storageKey==='ks_team_players'?'لاعبين الفريق':'لاعبين الأكاديمية'} من نسخة</h3>
+      <p class="muted" style="font-size:13px; line-height:1.9;">
+        اختار ملف النسخة الاحتياطية (<b>KillingShot_Backup_....json</b> اللي بينزل من "💾 باك أب واستيراد").
+        هيتم استبدال <b>اللاعبين بس</b> باللي في النسخة. حسابات الإداريين والمدربين والإدارة وحسابك، والاشتراكات والخزينة والمحاسبة <b>مش هيتلمسوا</b>.
+        اللاعبين هيرجعوا بنفس الـ ID بتاعهم، فاشتراكاتهم وحضورهم هيفضلوا مربوطين بيهم.
+      </p>
+      <label style="display:flex; align-items:center; gap:10px; border:2px dashed rgba(255,255,255,0.15); border-radius:14px; padding:18px; cursor:pointer; justify-content:center; flex-direction:column;">
+        <span style="font-size:28px;">📂</span><span style="font-weight:700;">اختار ملف النسخة (.json)</span>
+        <input type="file" accept=".json,application/json" style="display:none;" onchange="ksLoadRestoreFile(this.files[0])">
+      </label>
+      <div id="ksRestorePreview" style="margin-top:14px;"></div>
+      <div style="margin-top:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.08);">
+        <div class="muted" style="font-size:12.5px; margin-bottom:8px;">مفيش نسخة؟ تقدر تمسح كل اللاعبين وتبدأ من جديد (الحسابات مش هتتمسح، وهينزلك نسخة من الحالي قبل المسح):</div>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red-light);" onclick="ksWipePlayers()">🗑️ مسح كل ${storageKey==='ks_team_players'?'لاعبين الفريق':'لاعبين الأكاديمية'}</button>
+      </div>
+      <div class="modal-actions"><button class="btn btn-ghost btn-block" onclick="closeModal()">إلغاء</button></div>
+    </div>
+  </div>`;
+}
+async function ksLoadRestoreFile(file){
+  if(!file) return;
+  const box = document.getElementById('ksRestorePreview');
+  let backup;
+  try { backup = JSON.parse(await file.text()); } catch(e){ box.innerHTML = '<div style="color:var(--red-light);">❌ الملف مش JSON سليم</div>'; return; }
+  const key = window._ksRestoreKey;
+  let list = null, date = '';
+  if(backup && backup.data && Array.isArray(backup.data[key])){ list = backup.data[key]; date = backup._meta && backup._meta.exportedAt; }
+  else if(backup && backup.key === key && Array.isArray(backup.players)){ list = backup.players; date = backup.at; }
+  else if(Array.isArray(backup)) list = backup;
+  if(!list){ box.innerHTML = '<div style="color:var(--red-light);">❌ الملف ده مفيهوش بيانات '+key+'</div>'; return; }
+  const branches = await getTreasuryBranches();
+  const players = list.filter(p => p && p.role === 'player');
+  let valid = 0; for(const p of players) if(await ksPlayerLooksValid(p, branches)) valid++;
+  const byBranch = {};
+  players.forEach(p => { byBranch[p.branch||'—'] = (byBranch[p.branch||'—']||0) + 1; });
+  const current = ((await sGet(key)) || []).filter(p => p.role === 'player');
+  const ids = new Set(players.map(p => p.id));
+  let extraValid = 0; for(const p of current) if(!ids.has(p.id) && await ksPlayerLooksValid(p, branches)) extraValid++;
+  window._ksRestoreSrc = players;
+  box.innerHTML = `
+  <div class="card" style="padding:14px 16px; background:rgba(58,143,107,0.08); border:1px solid rgba(58,143,107,0.25);">
+    <div style="font-weight:800;">📦 النسخة: ${date ? new Date(date).toLocaleString('ar-EG') : 'بدون تاريخ'}</div>
+    <div style="margin-top:6px; font-size:13px;">فيها <b>${players.length}</b> لاعب — منهم <b>${valid}</b> بياناتهم سليمة${players.length-valid?` و <span style="color:var(--warn);">${players.length-valid} شكلهم ملخبط</span>`:''}</div>
+    <div style="margin-top:6px; font-size:12.5px; color:var(--paper-dim); line-height:1.8;">${Object.entries(byBranch).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([b,n])=>b+': '+n).join(' · ')}</div>
+    <div style="margin-top:6px; font-size:13px;">دلوقتي عندك <b>${current.length}</b> لاعب.</div>
+    ${extraValid?`<label style="display:flex; gap:8px; align-items:center; margin-top:10px; font-size:13px;"><input type="checkbox" id="ksKeepNew" checked> احتفظ بـ ${extraValid} لاعب سليم اتضافوا بعد النسخة</label>`:''}
+  </div>
+  ${players.length-valid ? `<div style="margin-top:10px; color:var(--warn); font-size:12.5px;">⚠️ النسخة دي نفسها فيها بيانات ملخبطة — غالباً اتاخدت بعد الاستيراد الغلط. جرّب نسخة أقدم لو عندك.</div>` : ''}
+  <button class="btn btn-primary btn-block" style="margin-top:12px;" onclick="ksApplyRestore()">♻️ استرجع ${players.length} لاعب</button>`;
+}
+async function ksApplyRestore(){
+  const key = window._ksRestoreKey, src = window._ksRestoreSrc;
+  if(!src) return;
+  const keepNew = !!(document.getElementById('ksKeepNew') && document.getElementById('ksKeepNew').checked);
+  if(!confirm('هيتم استبدال اللاعبين الحاليين بـ '+src.length+' لاعب من النسخة.\nهينزلك ملف بالبيانات الحالية قبل التغيير.\nنكمل؟')) return;
+  if(!(await ksSafetyBackup('قبل استرجاع اللاعبين من ملف'))) return;
+  const all = (await sGet(key)) || [];
+  ksDownloadJSON({key, at:new Date().toISOString(), players: all}, key+'_قبل_الاسترجاع_'+todayISO()+'.json');
+  const staff = all.filter(p => p.role !== 'player');
+  const ids = new Set(src.map(p => p.id));
+  const branches = await getTreasuryBranches();
+  const extra = [];
+  if(keepNew) for(const p of all) if(p.role==='player' && !ids.has(p.id) && await ksPlayerLooksValid(p, branches)) extra.push(p);
+  const next = [...staff, ...src, ...extra];
+  if(window.sForceSet) await sForceSet(key, next); else await sSet(key, next);
+  closeModal();
+  showToast('✅ اترجع '+(src.length+extra.length)+' لاعب');
+  renderPage();
+}
+async function ksWipePlayers(){
+  const key = window._ksRestoreKey;
+  const all = (await sGet(key)) || [];
+  const n = all.filter(p => p.role === 'player').length;
+  if(!confirm('هيتمسح '+n+' لاعب.\nالحسابات (إداريين/مدربين/إدارة/مطور) مش هتتمسح.\nهينزلك ملف بالبيانات الحالية قبل المسح.\nمتأكد؟')) return;
+  if(prompt('اكتب كلمة: مسح  للتأكيد') !== 'مسح') { showToast('اتلغى'); return; }
+  if(!(await ksSafetyBackup('قبل مسح كل اللاعبين'))) return;
+  ksDownloadJSON({key, at:new Date().toISOString(), players: all}, key+'_قبل_المسح_'+todayISO()+'.json');
+  const staff = all.filter(p => p.role !== 'player');
+  if(window.sForceSet) await sForceSet(key, staff); else await sSet(key, staff);
+  closeModal();
+  showToast('✅ اتمسح '+n+' لاعب');
+  renderPage();
+}
+
+async function ksRunCleanup(){
+  const ids = [...document.querySelectorAll('.ksClnChk:checked')].map(c => window._ksCleanupList[+c.dataset.i].p.id);
+  if(!ids.length){ showToast('مفيش حد متحدد'); return; }
+  if(!confirm('هيتحذف '+ids.length+' لاعب.\nهينزلك ملف نسخة احتياطية قبل الحذف.\nنكمل؟')) return;
+  if(!(await ksSafetyBackup('قبل حذف '+ids.length+' لاعب من إصلاح الاستيراد'))) return;
+  const key = window._ksCleanupKey;
+  const players = (await sGet(key)) || [];
+  // نسخة احتياطية قبل الحذف
+  const blob = new Blob([JSON.stringify({key, at:new Date().toISOString(), players}, null, 1)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = key+'_قبل_التنظيف_'+todayISO()+'.json'; a.click();
+  const set = new Set(ids);
+  const kept = players.filter(p => !set.has(p.id));
+  await sSet(key, kept);
+  closeModal();
+  showToast('✅ اتحذف '+(players.length-kept.length)+' لاعب');
   renderPage();
 }
 
